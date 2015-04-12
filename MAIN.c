@@ -25,13 +25,18 @@ uint8_t apfound;
 uint8_t* target_ssid;
 uint8_t adjust_seconds;
 
-struct Time {
+struct Time{
 	uint16_t year;
 	uint8_t month;
 	uint8_t day;
 	uint8_t hour;
 	uint8_t minute;
 	uint8_t second;
+};
+
+union TimeUnion {
+	uint32_t ntp;
+	struct Time time;
 };
 
 char putchar(char c)
@@ -45,30 +50,24 @@ char putchar(char c)
 	else return Uart_Putchar(c);
 }
 
-void sleep_probable_minute(void)
+void sleep_probable_time(void)
 {
-	uint8_t count;
-	uint16_t wktc_cnt;
-	count = 3;
-	wktc_cnt = (WIRC / 16) * 10 - 1;	//10s
-	while (count--)
-	{
-		WKTCH &= ~0x80;
-		WKTCL = (uint8_t)wktc_cnt;
-		WKTCH = (uint8_t)(wktc_cnt >> 8);
-		WKTCH |= 0x80;
-		PCON |= 0x02;
-		_nop_();
-		_nop_();
-		_nop_();
-		_nop_();
-	}
+	uint16_t wktc_cnt = (WIRC / 16) * 10 - 1;	//10s
+	WKTCH &= ~0x80;
+	WKTCL = (uint8_t)wktc_cnt;
+	WKTCH = (uint8_t)(wktc_cnt >> 8);
+	WKTCH |= 0x80;
+	PCON |= 0x02;
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
 }
 
 void sleep(uint16_t minutes)
 {
 	uint16_t count = (minutes * 60 + adjust_seconds - 1) / adjust_seconds;
-	while(count--) sleep_probable_minute();
+	while(count--) sleep_probable_time();
 }
 
 uint8_t find_ap(uint8_t* linestr)
@@ -143,7 +142,7 @@ void delete_ntp_connection(void)
 	ESP8266_unregisterSingleUDP();
 }
 
-uint32_t get_ntp_time(void)
+bool request_ntp(uint32_t *ntptime)
 {
 	uint16_t recvlen;
 	uint8_t code packetBuffer[] = {
@@ -171,29 +170,29 @@ uint32_t get_ntp_time(void)
 	if (!ESP8266_send(packetBuffer, sizeof(packetBuffer)))
 	{
 		DebugMsg("Fail to send NTP data\n");
-		return 0;
+		return false;
 	}
 	recvlen = ESP8266_recv(10000);
 	//DebugMsg2("Received %u bytes data\n", recvlen);
 	if (recvlen != sizeof(packetBuffer))
 	{
-		return 0;
+		return false;
 	}
 	// the timestamp starts at byte 40 of the received packet and is four bytes,
 	// or two words, long. First, esxtract the two words:
 	// combine the four bytes (two words) into a long integer
 	// this is NTP time (seconds since Jan 1 1900):
-	return (uint32_t)Rx_BUF[40] << 24 | (uint32_t)Rx_BUF[41] << 16 | (uint32_t)Rx_BUF[42] << 8 | Rx_BUF[43];
+	*ntptime = (uint32_t)Rx_BUF[40] << 24 | (uint32_t)Rx_BUF[41] << 16 | (uint32_t)Rx_BUF[42] << 8 | Rx_BUF[43];
+	return true;
 }
 
 
-bool get_current_time(struct Time* time, sint8_t timezone)
+void calculate_time(union TimeUnion* timeunion, sint8_t timezone)
 {
-	uint32_t tempticks;
 	uint8_t code months[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30 };
+	uint32_t tempticks = timeunion->ntp;
+	struct Time *time = &timeunion->time;
 
-	tempticks = get_ntp_time();
-	if (!tempticks) return false;
 	// now convert NTP time into everyday time:
 	// Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
 	// subtract seventy years:
@@ -230,67 +229,61 @@ bool get_current_time(struct Time* time, sint8_t timezone)
 	time->hour   = (tempticks) / 3600;
 	time->minute = (tempticks % 3600) / 60;
 	time->second = (tempticks % 60);
-	return true;
 }
 
-bool get_time(struct Time* now)
+void show_time(struct Time* now)
+{
+	debug_set = 1;
+	printf("time: [%u-%02u-%02u %02u:%02u:%02u]\n", 
+			(uint16_t)now->year, (uint16_t)now->month, (uint16_t)now->day,
+			(uint16_t)now->hour, (uint16_t)now->minute, (uint16_t)now->second);
+	debug_set = 0;
+}
+
+uint32_t get_ntp_time(void)
 {
 	uint8_t ret = true;
+	uint32_t ntptime;
 	P_ESPCHIP_EN = 1;
 	delay(1000);
 	TRY(connect_to_ap(AP_SSID, AP_PSWD), 3, ret);
 	TRY(create_ntp_connection(), 3, ret);
-	TRY(get_current_time(now, 8), 3, ret);
+	TRY(request_ntp(&ntptime), 3, ret);
 	delete_ntp_connection();
 	ESP8266_leaveAP();
 	P_ESPCHIP_EN = 0;
 	if(ret)
 	{
-		debug_set = 1;
-		printf("time: [%u-%02u-%02u %02u:%02u:%02u]\n", 
-			(uint16_t)now->year, (uint16_t)now->month, (uint16_t)now->day,
-			(uint16_t)now->hour, (uint16_t)now->minute, (uint16_t)now->second);
-		debug_set = 0;
+		return ntptime;
 	}
-	else
-	{
-		delay(1000);
-	}
-	return ret;
+	delay(1000);
+	return 0;
 }
-void adjust_sleep_timer(void)
+void adjust_sleep_timer(uint32_t nowntp, uint16_t sleep_minute)
 {
-	uint8_t ret = true, trytimes = 3;
-	P_ESPCHIP_EN = 1;
-	delay(1000);
-	TRY(connect_to_ap(AP_SSID, AP_PSWD), 3, ret);
-	TRY(create_ntp_connection(), 3, ret);
-	while (ret && trytimes--)
+	static uint32_t last_ntp = 0;
+	static uint8_t totalcount = 1;
+
+	if (sleep_minute > 10)
 	{
-		uint32_t starttime, endtime;
-		if (!(starttime = get_ntp_time())) continue;
-		sleep_probable_minute();
-		if (!(endtime = get_ntp_time())) continue;
-		adjust_seconds = endtime - starttime;
-		DebugMsg2("Real seconds for sleeping a time is about %us\n", (uint16_t)adjust_seconds);
-		break;
+		uint16_t sleepcount = (sleep_minute * 60 + adjust_seconds - 1) / adjust_seconds;
+		uint16_t totalseconds = (uint16_t)adjust_seconds * totalcount + (nowntp - last_ntp) / sleepcount;
+		adjust_seconds = totalseconds / ++totalcount;
+		if (totalcount > 48) totalcount = 1;
+		DebugMsg3("Real seconds for sleeping is about %us, adjust seconds to %us\n", (uint16_t)(nowntp - last_ntp), (uint16_t)adjust_seconds);
 	}
-	if(!ret || !trytimes)
-	{
-		DebugMsg2("Failed to adjust sleep timer, using old %us\n", (uint16_t)adjust_seconds);
-	}
-	delete_ntp_connection();
-	ESP8266_leaveAP();
-	P_ESPCHIP_EN = 0;
-	delay(1000);
+	last_ntp = nowntp;
 }
 
-void beep_time(uint8_t hour)
+void beep_time(uint8_t hour, uint8_t minute)
 {
 	static uint8_t last_hour = 0;
+	static uint8_t last_minute = 0;
+	minute = minute < 30 ? 0 : 1;
 	if (hour != last_hour)
 	{
 		last_hour = hour;
+		last_minute = minute;
 		if (last_hour > 6 && last_hour < 23)
 		{
 			uint8_t bee = last_hour > 12 ? last_hour - 12 : last_hour;
@@ -301,6 +294,16 @@ void beep_time(uint8_t hour)
 				P_BEEP = 0;
 				delay(700);
 			}
+		}
+	}
+	if (minute != last_minute)
+	{
+		last_minute = minute;
+		if (last_hour > 6 && last_hour < 23)
+		{
+			P_BEEP = 1;
+			delay(300);
+			P_BEEP = 0;
 		}
 	}
 }
@@ -318,7 +321,7 @@ void try_water_plants(struct Time* time)
 		P_AC_SWITCH = 1;
 		while (millis() - start < AC_POWERON_TIME)
 		{
-			beep_time(time->hour);
+			beep_time(time->hour, time->minute);
 			idle();
 		}
 		P_AC_SWITCH = 0;
@@ -328,14 +331,15 @@ void try_water_plants(struct Time* time)
 	}
 	else
 	{
-		beep_time(time->hour);
+		beep_time(time->hour, time->minute);
 	}
 }
 
 void main(void)
 {
-	struct Time time;
-	uint16_t sleeptime;
+	union TimeUnion time;
+	uint16_t sleeptime = 0;
+
 	ESP8266_init();
 	Uart3_Init();
 	//GPIO setting
@@ -348,24 +352,22 @@ void main(void)
 	P_ESPCHIP_EN = 0;
 	EA = 1;
 
-	adjust_seconds = 60;
+	adjust_seconds = 20;
 	DebugMsg("!!!ESP8266 Auto-Water Plants Controller!!!\n");
 	while (1)
 	{
-		while (!get_time(&time));
-		try_water_plants(&time);
-		if ((time.hour == 7 || time.hour == 19) && time.minute < 31)
+		while (!(time.ntp = get_ntp_time()));
+		adjust_sleep_timer(time.ntp, sleeptime);
+		calculate_time(&time, 8);
+		show_time(&time.time);
+		try_water_plants(&time.time);
+		if (time.time.hour == 23)
 		{
-			adjust_sleep_timer();
-			while (!get_time(&time));
-		}
-		if (time.hour == 23)
-		{
-			sleeptime = 8 * 60 - time.minute + 1;
+			sleeptime = 8 * 60 - time.time.minute;
 		}
 		else
 		{
-			sleeptime = (60 - time.minute) % 30 + 1;
+			sleeptime = 30 - time.time.minute % 30;
 		}
 		DebugMsg2("sleep %u minutes\n", sleeptime);
 		while (isUartRunning() || isUart3Running());
