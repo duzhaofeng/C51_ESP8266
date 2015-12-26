@@ -12,8 +12,8 @@
 	if (_ret){uint8_t i;               \
 	for (i = 0; i < times; i++)        \
 	{                                  \
-	if((_ret = (do_someing))) break; \
-	delay(500);                      \
+		if((_ret = (do_someing))) break; \
+		delay(500);                      \
 	}}
 
 sbit P_ESPCHIP_EN = P5^4;
@@ -190,6 +190,7 @@ bool request_ntp(uint32_t *ntptime)
 void calculate_time(union TimeUnion* timeunion, sint8_t timezone)
 {
 	uint8_t code months[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30 };
+  uint16_t tempdays;
 	uint32_t tempticks = timeunion->ntp;
 	struct Time *time = &timeunion->time;
 
@@ -199,33 +200,35 @@ void calculate_time(union TimeUnion* timeunion, sint8_t timezone)
 	tempticks -= 2208988800UL;
 	tempticks += timezone * 3600; //adjust time zone (3600 equals secs per hour)
 
-	time->year = (tempticks / (365*86400L)) + 1970;	//(86400 equals secs per day)
-	tempticks = tempticks % (365*86400L);
-	tempticks -= ((time->year - 1969) / 4 - (time->year - 1901) / 100 + (time->year - 1601) / 400) * 86400L; //adjust leap year
-
-	time->day = (tempticks / 86400L) + 1;
+	tempdays  = (tempticks / 86400L) + 1;	//(86400 equals secs per day)
 	tempticks = (tempticks % 86400L);
 
-	for (time->month = 1; time->month < 12; time->month++)
+	time->year = 1970;
+	while (tempdays > 365)
 	{
-		if (time->day > months[time->month - 1])
+		time->year ++;
+		tempdays -= 365;
+		if (IS_LEAPYEAR(time->year) && tempdays)
 		{
-			time->day -= months[time->month - 1];
-			if (IS_LEAPYEAR(time->year) && time->month == 2)
-			{
-				if (time->day == 1)
-				{
-					time->day = 29;
-					break;
-				}
-				else
-				{
-					time->day--;
-				}
-			}
+			tempdays --; //adjust leap year
 		}
-		else break;
 	}
+	time->month = 0;
+	while (tempdays > months[time->month])
+	{
+		if (IS_LEAPYEAR(time->year) && time->month == 1)
+		{
+			if (tempdays == 29)
+			{
+				break;
+			}
+			tempdays --;
+		}
+		tempdays -= months[time->month];
+		time->month ++;
+	}
+	time->month ++;
+	time->day    =  tempdays;
 	time->hour   = (tempticks) / 3600;
 	time->minute = (tempticks % 3600) / 60;
 	time->second = (tempticks % 60);
@@ -254,6 +257,7 @@ uint32_t get_ntp_time(void)
 	P_ESPCHIP_EN = 0;
 	if(ret)
 	{
+		//DebugMsg2("NTP time: %lu\n", ntptime);
 		return ntptime;
 	}
 	delay(1000);
